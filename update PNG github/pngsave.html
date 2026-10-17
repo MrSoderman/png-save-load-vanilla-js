@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+<style>
+    body {
+      height: 100vh; flex-direction: column; justify-content: center; margin: 0; 
+      background-color: #808080; display: flex;overflow-y: hidden; align-items: center;
+    }
+    canvas {border: 8px solid black; margin-bottom: 16px;}
+  </style>
+</head>
+
+<body>
+  <canvas id="canvas" width="100" height="100"></canvas>
+  <div><button id="saveButton">Save PNG</button><button id="loadButton">Load PNG</button>
+  <input type="file" id="fileInput" accept="image/png" hidden></div>
+<script>
+const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10];
+// CRC-32 (used for every chunk). The table holds the result for every
+// possible byte, so we process a whole byte per step instead of 8 bits.
+const CRC_TABLE = new Uint32Array(256);
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+  CRC_TABLE[n] = c;
+}
+// CRC-32 of buf[start .. end-1]
+function crc32(buf, start, end) {
+  let c = 0xFFFFFFFF;
+  for (let i = start; i < end; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0; // >>> 0 makes it an unsigned number
+}
+// Adler-32 (used by zlib, over the UNcompressed data). Two running sums.
+function adler32(buf, start, end) {
+  let a = 1, b = 0;
+  for (let i = start; i < end; i++) {
+    a = (a + buf[i]) % 65521; // 65521 = largest prime below 65536
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+// BYTE HELPERS  (PNG numbers are big-endian: high byte first)
+// Write a 32-bit number at buf[pos]; returns the position after it.
+function put32(buf, pos, v) {
+  buf[pos]     = (v >>> 24) & 255; buf[pos + 1] = (v >>> 16) & 255;
+  buf[pos + 2] = (v >>> 8)  & 255; buf[pos + 3] =  v         & 255;
+  return pos + 4;
+}
+// Read a 32-bit number from buf[pos].
+function get32(buf, pos) {
+  return ((buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3]) >>> 0;
+}
+// Write one chunk (LENGTH, TYPE, DATA, CRC) at out[pos].
+// data is a Uint8Array, dataLen how many of its bytes to use. Returns the position after the chunk.
+function putChunk(out, pos, type, data, dataLen) {
+  pos = put32(out, pos, dataLen);                               // LENGTH
+  const typeStart = pos;
+  for (let i = 0; i < 4; i++) out[pos++] = type.charCodeAt(i);  // TYPE
+  out.set(data.subarray(0, dataLen), pos);                      // DATA
+  pos += dataLen;
+  return put32(out, pos, crc32(out, typeStart, pos));           // CRC of TYPE+DATA
+}
+//   ENCODER  (RGBA pixels -> PNG bytes)
+const MAX_STORED = 65535;    // largest stored DEFLATE block (16-bit length)
+// w, h  : image size in pixels
+// rgba  : w*h*4 bytes, R G B A per pixel (exactly what getImageData gives)
+// returns a Uint8Array holding the whole .png file
+function encodePNG(w, h, rgba) {
+  // --- Step 1: raw scanlines = filter byte 0 + the row's pixels ---------
+  const rowBytes = w * 4;
+  const rawLen   = h * (1 + rowBytes);
+  const raw      = new Uint8Array(rawLen);
+  let r = 0;
+  for (let y = 0; y < h; y++) {
+    raw[r++] = 0;               // filter 0 = none
+    raw.set(rgba.subarray(y * rowBytes, (y + 1) * rowBytes), r);
+    r += rowBytes;
+  }
+  // --- Step 2: wrap them in a zlib stream of STORED blocks --------------
+  // Each stored block = 1 header byte + LEN (2) + NLEN (2) + the bytes.
+  const blocks = Math.ceil(rawLen / MAX_STORED);
+  const zLen   = 2 + blocks * 5 + rawLen + 4;
+  const z      = new Uint8Array(zLen);
+  let p = 0;
+  // zlib header: 0x78 = "deflate, 32K window"; 0x01 = "fastest" level.
+  // The rule: (first*256 + second) must divide evenly by 31. 0x7801 does.
+  z[p++] = 0x78;
+  z[p++] = 0x01;
+  let src = 0;
+  for (let b = 0; b < blocks; b++) {
+    const len = Math.min(MAX_STORED, rawLen - src);
+    // Header byte: bit 0 = BFINAL (1 on the last block), bits 1-2 = BTYPE 00 (stored)
+    z[p++] = (b === blocks - 1) ? 1 : 0;
+    // LEN, little-endian (DEFLATE is little-endian, unlike PNG!)
+    z[p++] = len & 255;
+    z[p++] = len >>> 8;
+    // NLEN = LEN with all bits flipped; a safety check for the reader
+    z[p++] = ~len & 255;
+    z[p++] = (~len >>> 8) & 255;
+    // the bytes themselves, copied unchanged
+    z.set(raw.subarray(src, src + len), p);
+    p += len;
+    src += len;
+  }
+  put32(z, p, adler32(raw, 0, rawLen)); // zlib trailer: checksum of raw data
+  // --- Step 3: build the file: signature + IHDR + IDAT + IEND -----------
+  const ihdr = new Uint8Array(13);
+  put32(ihdr, 0, w);
+  put32(ihdr, 4, h);
+  ihdr[8]  = 8;    // bit depth: 8 bits per channel
+  ihdr[9]  = 6;    // colour type 6 = RGBA
+  ihdr[10] = 0;    // compression method (always 0 = zlib)
+  ihdr[11] = 0;    // filter method (always 0)
+  ihdr[12] = 0;    // interlace: 0 = none
+  // every chunk costs 12 bytes (LENGTH + TYPE + CRC) plus its data
+  const png = new Uint8Array(8 + (12 + 13) + (12 + zLen) + 12);
+  png.set(PNG_SIGNATURE, 0);
+  let q = 8;
+  q = putChunk(png, q, "IHDR", ihdr, 13);
+  q = putChunk(png, q, "IDAT", z, zLen);
+  putChunk(png, q, "IEND", ihdr, 0); // 0 bytes of data
+  return png;
+}
+let pngW = 0, pngH = 0, pngRGBA = null;
+function paeth(a, b, c) {  // pick whichever of a, b, c is closest to a + b - c
+  const p = a + b - c;
+  const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+  if (pa <= pb && pa <= pc) return a;
+  return (pb <= pc) ? b : c;
+}
+// raw: rows of (filter byte + rowBytes bytes)  ->  img: rows of rowBytes bytes
+function unfilter(raw, img, h, rowBytes, bpp) {
+  for (let y = 0; y < h; y++) {
+    const f   = raw[y * (rowBytes + 1)];          // the filter byte
+    const src = y * (rowBytes + 1) + 1;
+    const dst = y * rowBytes;
+    const up  = dst - rowBytes;                   // start of the row above
+    for (let x = 0; x < rowBytes; x++) {
+      const a = (x >= bpp)          ? img[dst + x - bpp] : 0;
+      const b = (y > 0)             ? img[up + x]        : 0;
+      const c = (x >= bpp && y > 0) ? img[up + x - bpp]  : 0;
+      let v = raw[src + x];
+      if      (f === 1) v += a;                   // Sub
+      else if (f === 2) v += b;                   // Up
+      else if (f === 3) v += (a + b) >> 1;        // Average
+      else if (f === 4) v += paeth(a, b, c);      // Paeth
+      else if (f !== 0) throw new Error("bad filter type " + f);
+      img[dst + x] = v & 255;                     // wrap around, like a byte
+    }
+  }
+}
+//  PAGE WIRING  (buttons, canvas)
+function saveCanvasAsPNG(canvas) {
+  const ctx  = canvas.getContext("2d");
+  const rgba = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  const blob = new Blob([encodePNG(canvas.width, canvas.height, rgba)], { type: "image/png" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "canvas.png";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);   // free the memory
+}
+function loadWithBrowser(canvas, file) {
+  createImageBitmap(file).then(bmp => {
+    canvas.width = bmp.width;              // resizing also clears the canvas
+    canvas.height = bmp.height;
+    canvas.getContext("2d").drawImage(bmp, 0, 0);
+  }).catch(e => alert("Could not load: " + e.message));
+}
+document.addEventListener("DOMContentLoaded", () => {
+  const canvas    = document.getElementById("canvas");
+  const fileInput = document.getElementById("fileInput");
+  const ctx = canvas.getContext("2d");
+  // demo picture: a red square with 50% transparency
+  ctx.fillStyle = "red"; ctx.globalAlpha = 0.5; ctx.fillRect(10, 10, 80, 80);
+  document.getElementById("saveButton").addEventListener("click", () => saveCanvasAsPNG(canvas));
+  document.getElementById("loadButton").addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    loadWithBrowser(canvas, file);          // <-- standard loader
+    fileInput.value = "";                   // so the same file can be picked again
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+<style>
+    body {
+      height: 100vh; flex-direction: column; justify-content: center; margin: 0; 
+      background-color: #808080; display: flex;overflow-y: hidden; align-items: center;
+    }
+    canvas {border: 8px solid black; margin-bottom: 16px;}
+  </style>
+</head>
+
+<body>
+  <canvas id="canvas" width="100" height="100"></canvas>
+  <button id="saveButton">Save PNG</button>
+
+  <script>
+    // A minimal PNG encoder for 32-bit RGBA images, and creates a raw PNG file from scratch
+    function crc32(buf) {
+      let crc = 0xffffffff;
+      for (let i = 0; i < buf.length; i++) {
+        crc ^= buf[i];
+        for (let j = 0; j < 8; j++) {
+          crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+        }
+      }
+      return (crc ^ 0xffffffff) >>> 0;
+    }
+
+    function adler32(buf) {
+      let a = 1, b = 0;
+      for (let i = 0; i < buf.length; i++) {
+        a = (a + buf[i]) % 65521;
+        b = (b + a) % 65521;
+      }
+      return (b << 16) | a;
+    }
+
+    function u32(u) {
+      return [(u >>> 24) & 0xff, (u >>> 16) & 0xff, (u >>> 8) & 0xff, u & 0xff];
+    }
+
+    function stringToBytes(str) {
+      let b = [];
+      for (let i = 0; i < str.length; i++) b.push(str.charCodeAt(i));
+      return b;
+    }
+
+    function createChunk(type, dataArr) {
+      // Create chunk: length (4 bytes), type (4 bytes), data, crc (4 bytes)
+      let typeBytes = stringToBytes(type);
+      let length = dataArr.length;
+      let lengthBytes = u32(length);
+      let crcData = typeBytes.concat(dataArr);
+      let crcBytes = u32(crc32(new Uint8Array(crcData)));
+      return lengthBytes.concat(typeBytes, dataArr, crcBytes);
+    }
+    // This function generates a 32-bit (RGBA) PNG from raw pixel data
+    // img must be an array or Uint8Array of length width*height*4
+    function svpng(w, h, img) {
+      let data = [];
+      // PNG Signature:
+      data = data.concat([137,80,78,71,13,10,26,10]);
+
+      // IHDR chunk: width, height, bit depth 8, color type 6 (RGBA), compression 0, filter 0, interlace 0
+      let ihdrData = [].concat(
+        u32(w),
+        u32(h),
+        [8, 6, 0, 0, 0]
+      );
+      data = data.concat(createChunk("IHDR", ihdrData));
+
+      // Build raw image data: for each scanline, prepend a 0 filter byte then RGBA pixels
+      let raw = [];
+      let stride = w * 4;
+      for (let y = 0; y < h; y++) {
+        raw.push(0); // filter type 0
+        for (let x = 0; x < stride; x++) {
+          raw.push(img[y * stride + x]);
+        }
+      }
+      // Compress raw data using uncompressed DEFLATE (store blocks)
+      // Using minimal zlib stream with "no compression"
+      let zlibHeader = [0x78, 0x01]; // Deflate header (no compression, fastest)
+      let deflate = zlibHeader.slice();
+      // Uncompressed block:
+      // BFINAL (1 bit) and BTYPE (2 bits = 00) in one byte
+      // LEN (2 bytes, little-endian) and NLEN (2 bytes, one's complement)
+      let blockLen = raw.length;
+      // For simplicity assume blockLen < 0xFFFF
+      deflate.push(0x01); // final block, no compression
+      deflate.push(blockLen & 0xff, (blockLen >> 8) & 0xff);
+      deflate.push((~blockLen) & 0xff, ((~blockLen) >> 8) & 0xff);
+      deflate = deflate.concat(raw);
+      let adler = adler32(raw);
+      deflate = deflate.concat(u32(adler));
+      //
+      data = data.concat(createChunk("IDAT", deflate));
+      // IEND chunk:
+      data = data.concat(createChunk("IEND", []));
+      // 
+      return new Uint8Array(data);
+    }
+
+    function saveCanvasAsPNG(canvas) {
+      let ctx = canvas.getContext("2d");
+      let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      let blob = new Blob([svpng(canvas.width, canvas.height, imageData)], { type: "image/png" });
+      let link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "canvas.png";
+      link.click();
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      let canvas = document.getElementById("canvas");
+      let ctx = canvas.getContext("2d");
+      ctx.fillStyle = "red";
+      ctx.globalAlpha = 0.5
+      ctx.fillRect(10, 10, 80, 80); // Draw a red square with 50% alpha transparency to the canvas
+      document.getElementById("saveButton").addEventListener("click", () => saveCanvasAsPNG(canvas));
+    });
+  </script>
+</body>
+
+</html>
