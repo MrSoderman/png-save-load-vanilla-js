@@ -1,4 +1,4 @@
-# PngSaveJS
+# Png-Save-Load-JS
 
 Save and load 32-bit RGBA PNG images in about 75 lines of plain JavaScript. No dependencies, no compression. Written to be read: a short way to learn how a PNG file is actually built.
 
